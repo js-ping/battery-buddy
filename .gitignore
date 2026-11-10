@@ -1,0 +1,7 @@
+build/
+*.icns
+*.iconset/
+render_test
+make_icon
+BatteryBuddy
+.DS_Store
