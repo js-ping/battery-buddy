@@ -21,12 +21,13 @@ func runBatt(_ args: [String]) -> String {
     proc.arguments = args
     let out = Pipe()
     proc.standardOutput = out
-    proc.standardError = Pipe()
+    // stderr 必须丢弃：不读的管道写满 64KB 会永久阻塞子进程
+    proc.standardError = FileHandle.nullDevice
     do {
         try proc.run()
-        proc.waitUntilExit()
     } catch { return "" }
     let data = out.fileHandleForReading.readDataToEndOfFile()
+    proc.waitUntilExit()
     return String(data: data, encoding: .utf8) ?? ""
 }
 
@@ -104,61 +105,61 @@ func modeLabel(_ m: String) -> String {
     }
 }
 
-// MARK: - 电池图标（数字内嵌）
+// MARK: - 电池图标（iOS 风格：数字内嵌 + 双色反白）
 
-func batteryImage(percent: Int, charging: Bool) -> NSImage {
+func batteryImage(percent: Int, dark: Bool) -> NSImage {
     let w: CGFloat = 42
     let h: CGFloat = 16
+    let fg: NSColor = dark ? .white : .black
+    let bg: NSColor = dark
+        ? NSColor(calibratedWhite: 0.13, alpha: 1)
+        : NSColor(calibratedWhite: 0.97, alpha: 1)
 
     let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { _ in
         let bodyW: CGFloat = w - 3.5
         let bodyRect = NSRect(x: 0.8, y: 1.9, width: bodyW - 1.6, height: h - 3.8)
         let body = NSBezierPath(roundedRect: bodyRect, xRadius: 3.6, yRadius: 3.6)
         body.lineWidth = 1.25
-        NSColor.black.setStroke()
+        fg.setStroke()
         body.stroke()
 
         // 正极凸点
         let nub = NSRect(x: bodyW - 0.4, y: h / 2 - 2.2, width: 2.2, height: 4.4)
-        NSColor.black.setFill()
+        fg.setFill()
         NSBezierPath(roundedRect: nub, xRadius: 1.1, yRadius: 1.1).fill()
 
         // 电量填充
         let inset: CGFloat = 2.7
         let innerW = bodyW - inset * 2 - 0.8
         let pct = max(0, min(100, percent))
-        let fillW = innerW * CGFloat(pct) / 100
+        let fillW = max(0.001, innerW * CGFloat(pct) / 100)
+        let fillRect = NSRect(x: inset, y: inset, width: fillW, height: h - inset * 2)
 
-        // 淡底：保证低电量时数字也有反白依托
-        let innerRect = NSRect(x: inset, y: inset, width: innerW, height: h - inset * 2)
-        NSColor.black.withAlphaComponent(0.25).setFill()
-        NSBezierPath(roundedRect: innerRect, xRadius: 2, yRadius: 2).fill()
+        fg.setFill()
+        NSBezierPath(roundedRect: fillRect, xRadius: 2, yRadius: 2).fill()
 
-        if fillW > 0.4 {
-            let fillRect = NSRect(x: inset, y: inset, width: fillW, height: h - inset * 2)
-            NSColor.black.setFill()
-            NSBezierPath(roundedRect: fillRect, xRadius: 2, yRadius: 2).fill()
-        }
-
-        // 数字挖空（在填充区呈反白，空白区不可见）
+        // 数字：填充区内画背景色，区外画前景色 —— 自动反白，任何电量都可读
         let font = NSFont.monospacedDigitSystemFont(ofSize: pct >= 100 ? 8.5 : 9.5, weight: .bold)
-        let str = NSAttributedString(
-            string: "\(pct)",
-            attributes: [.font: font, .foregroundColor: NSColor.black]
-        )
-        let ts = str.size()
-        let origin = NSPoint(
-            x: (bodyW - ts.width) / 2,
-            y: (h - ts.height) / 2 + 0.6
-        )
-        if let ctx = NSGraphicsContext.current {
-            ctx.compositingOperation = .clear
-            str.draw(at: origin)
-            ctx.compositingOperation = .sourceOver
-        }
+        let text = "\(pct)"
+        let ts = (text as NSString).size(withAttributes: [.font: font])
+        let origin = NSPoint(x: (bodyW - ts.width) / 2, y: (h - ts.height) / 2 + 0.6)
+
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(rect: fillRect).addClip()
+        (text as NSString).draw(at: origin, withAttributes: [.font: font, .foregroundColor: bg])
+        NSGraphicsContext.restoreGraphicsState()
+
+        NSGraphicsContext.saveGraphicsState()
+        let outer = NSBezierPath(rect: NSRect(x: 0, y: 0, width: bodyW, height: h))
+        outer.append(NSBezierPath(rect: fillRect))
+        outer.windingRule = .evenOdd
+        outer.addClip()
+        (text as NSString).draw(at: origin, withAttributes: [.font: font, .foregroundColor: fg])
+        NSGraphicsContext.restoreGraphicsState()
+
         return true
     }
-    img.isTemplate = true
+    img.isTemplate = false
     return img
 }
 
@@ -172,21 +173,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var slider: NSSlider?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        setup()
+    }
+
+    private var didSetup = false
+    var latest = Snapshot()
+    var refreshing = false
+
+    func setup() {
+        guard !didSetup else { return }
+        didSetup = true
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         menu.delegate = self
         statusItem.menu = menu
+
+        // 先用占位图点亮图标，真实数据异步补上（同步调用会阻塞主线程）
+        statusItem.button?.image = batteryImage(percent: 0, dark: isDarkMode())
         refreshIcon()
 
         timer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             self?.refreshIcon()
         }
         RunLoop.main.add(timer!, forMode: .common)
+
+        // 系统深浅色切换时立即重绘图标
+        DistributedNotificationCenter.default.addObserver(
+            forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.applyIcon(self.latest)
+        }
     }
 
-    func refreshIcon() {
-        let s = readSnapshot()
-        guard let button = statusItem.button else { return }
+    func isDarkMode() -> Bool {
+        let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
+        return appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+    }
 
+    /// 后台刷新，绝不阻塞主线程（batt 调用实测可达数秒）
+    func refreshIcon() {
+        if refreshing { return }
+        refreshing = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let s = readSnapshot()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.latest = s
+                self.refreshing = false
+                self.applyIcon(s)
+            }
+        }
+    }
+
+    func applyIcon(_ s: Snapshot) {
+        guard let button = statusItem.button else { return }
         if !s.ok {
             let img = NSImage(systemSymbolName: "bolt.slash", accessibilityDescription: "batt 未运行")
             img?.isTemplate = true
@@ -195,14 +238,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         button.title = ""
-        button.image = batteryImage(percent: s.percent, charging: s.state == "charging")
+        let img = batteryImage(percent: s.percent, dark: isDarkMode())
+        button.image = img
     }
 
     // MARK: 菜单
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let s = readSnapshot()
+        let s = latest
+        refreshIcon()   // 后台更新，下次打开生效
 
         guard s.ok else {
             let bad = NSMenuItem(title: "batt 未运行或未安装", action: nil, keyEquivalent: "")
@@ -306,7 +351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func holdCurrent() {
-        let s = readSnapshot()
+        let s = latest
         guard s.percent > 0 else { return }
         runBatt(["limit", String(s.percent)])
         refreshIcon()
@@ -335,4 +380,5 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()
 app.delegate = delegate
+delegate.setup()
 app.run()
