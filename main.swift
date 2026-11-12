@@ -4,6 +4,7 @@ import Cocoa
 
 func locateBatt() -> String? {
     let candidates = [
+        NSHomeDirectory() + "/.local/bin/batt",
         "/usr/local/bin/batt",
         NSHomeDirectory() + "/Desktop/batt安装/batt"
     ]
@@ -11,6 +12,53 @@ func locateBatt() -> String? {
         return p
     }
     return nil
+}
+
+// MARK: - 自检与自愈
+
+let stableBattPath = NSHomeDirectory() + "/.local/bin/batt"
+
+/// 把 app 内置的 batt 铺到用户目录，保证 app 可移动、不依赖外部文件
+func ensureBattBinary() {
+    if FileManager.default.isExecutableFile(atPath: stableBattPath) { return }
+    guard let bundled = Bundle.main.path(forResource: "batt", ofType: nil) else { return }
+    let dir = (stableBattPath as NSString).deletingLastPathComponent
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    try? FileManager.default.removeItem(atPath: stableBattPath)
+    try? FileManager.default.copyItem(atPath: bundled, toPath: stableBattPath)
+    try? FileManager.default.setAttributes(
+        [.posixPermissions: 0o755], ofItemAtPath: stableBattPath
+    )
+}
+
+func daemonRunning() -> Bool {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    p.arguments = ["print", "system/cc.chlc.batt"]
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return false }
+    p.waitUntilExit()
+    return p.terminationStatus == 0
+}
+
+/// 弹系统授权框安装后台服务（app 运行在用户会话，可以正常弹框）
+func installDaemonAsync(completion: @escaping (Bool) -> Void) {
+    guard let bin = locateBatt() else { completion(false); return }
+    DispatchQueue.global(qos: .userInitiated).async {
+        let script = "do shell script \"'\(bin)' install --allow-non-root-access && sleep 1 && '\(bin)' limit 80\" with administrator privileges"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", script]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        var ok = false
+        if (try? p.run()) != nil {
+            p.waitUntilExit()
+            ok = p.terminationStatus == 0
+        }
+        DispatchQueue.main.async { completion(ok) }
+    }
 }
 
 @discardableResult
@@ -108,55 +156,33 @@ func modeLabel(_ m: String) -> String {
 // MARK: - 电池图标（iOS 风格：数字内嵌 + 双色反白）
 
 func batteryImage(percent: Int, dark: Bool) -> NSImage {
-    let w: CGFloat = 42
-    let h: CGFloat = 16
+    let w: CGFloat = 13
+    let h: CGFloat = 21
     let fg: NSColor = dark ? .white : .black
-    let bg: NSColor = dark
-        ? NSColor(calibratedWhite: 0.13, alpha: 1)
-        : NSColor(calibratedWhite: 0.97, alpha: 1)
 
     let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { _ in
-        let bodyW: CGFloat = w - 3.5
-        let bodyRect = NSRect(x: 0.8, y: 1.9, width: bodyW - 1.6, height: h - 3.8)
-        let body = NSBezierPath(roundedRect: bodyRect, xRadius: 3.6, yRadius: 3.6)
-        body.lineWidth = 1.25
+        fg.setFill()
         fg.setStroke()
-        body.stroke()
 
-        // 正极凸点
-        let nub = NSRect(x: bodyW - 0.4, y: h / 2 - 2.2, width: 2.2, height: 4.4)
-        fg.setFill()
-        NSBezierPath(roundedRect: nub, xRadius: 1.1, yRadius: 1.1).fill()
+        // 顶部正极凸点
+        let nub = NSRect(x: w / 2 - 2.3, y: h - 2.9, width: 4.6, height: 2.7)
+        NSBezierPath(roundedRect: nub, xRadius: 0.9, yRadius: 0.9).fill()
 
-        // 电量填充
-        let inset: CGFloat = 2.7
-        let innerW = bodyW - inset * 2 - 0.8
+        // 电池外壳
+        let body = NSRect(x: 0.9, y: 0.6, width: w - 1.8, height: h - 4.3)
+        let shell = NSBezierPath(roundedRect: body, xRadius: 2.6, yRadius: 2.6)
+        shell.lineWidth = 1.4
+        shell.stroke()
+
+        // 电量填充（自底向上）
+        let inset: CGFloat = 2.5
         let pct = max(0, min(100, percent))
-        let fillW = max(0.001, innerW * CGFloat(pct) / 100)
-        let fillRect = NSRect(x: inset, y: inset, width: fillW, height: h - inset * 2)
-
-        fg.setFill()
-        NSBezierPath(roundedRect: fillRect, xRadius: 2, yRadius: 2).fill()
-
-        // 数字：填充区内画背景色，区外画前景色 —— 自动反白，任何电量都可读
-        let font = NSFont.monospacedDigitSystemFont(ofSize: pct >= 100 ? 8.5 : 9.5, weight: .bold)
-        let text = "\(pct)"
-        let ts = (text as NSString).size(withAttributes: [.font: font])
-        let origin = NSPoint(x: (bodyW - ts.width) / 2, y: (h - ts.height) / 2 + 0.6)
-
-        NSGraphicsContext.saveGraphicsState()
-        NSBezierPath(rect: fillRect).addClip()
-        (text as NSString).draw(at: origin, withAttributes: [.font: font, .foregroundColor: bg])
-        NSGraphicsContext.restoreGraphicsState()
-
-        NSGraphicsContext.saveGraphicsState()
-        let outer = NSBezierPath(rect: NSRect(x: 0, y: 0, width: bodyW, height: h))
-        outer.append(NSBezierPath(rect: fillRect))
-        outer.windingRule = .evenOdd
-        outer.addClip()
-        (text as NSString).draw(at: origin, withAttributes: [.font: font, .foregroundColor: fg])
-        NSGraphicsContext.restoreGraphicsState()
-
+        let fillH = (body.height - inset * 2) * CGFloat(pct) / 100
+        if fillH > 0.3 {
+            let fill = NSRect(x: body.minX + inset, y: body.minY + inset,
+                              width: body.width - inset * 2, height: fillH)
+            NSBezierPath(roundedRect: fill, xRadius: 1.2, yRadius: 1.2).fill()
+        }
         return true
     }
     img.isTemplate = false
@@ -188,9 +214,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
 
+        // 自愈：铺开内置的 batt，服务不在就弹授权框装
+        ensureBattBinary()
+
         // 先用占位图点亮图标，真实数据异步补上（同步调用会阻塞主线程）
         statusItem.button?.image = batteryImage(percent: 0, dark: isDarkMode())
-        refreshIcon()
+
+        if daemonRunning() {
+            refreshIcon()
+        } else {
+            installDaemonAsync { [weak self] ok in
+                self?.refreshIcon()
+                if !ok {
+                    self?.statusItem.button?.title = " 需授权"
+                }
+            }
+        }
 
         timer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             self?.refreshIcon()
@@ -308,6 +347,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+        addStatic(menu, "重装后台服务…", #selector(repairService))
+        addStatic(menu, "彻底卸载…", #selector(uninstallApp))
         addStatic(menu, "打开管理脚本…", #selector(openManager))
         addStatic(menu, "退出", #selector(quit))
     }
@@ -360,6 +401,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func disableLimit() {
         runBatt(["disable"])
         refreshIcon()
+    }
+
+    @objc func repairService() {
+        installDaemonAsync { [weak self] _ in
+            self?.refreshIcon()
+        }
+    }
+
+    @objc func uninstallApp() {
+        let alert = NSAlert()
+        alert.messageText = "彻底卸载电池管家？"
+        alert.informativeText = """
+        将执行以下操作：
+        • 停止并移除后台服务
+        • 删除 batt 程序与所有配置
+        • 充电限制恢复为 macOS 默认（充满到 100%）
+        • 删除 app 自身
+
+        此操作不可撤销。
+        """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "卸载")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let home = NSHomeDirectory()
+        let appPath = Bundle.main.bundlePath
+        let bin = locateBatt() ?? (home + "/.local/bin/batt")
+
+        // 脚本以 base64 传递，避免引号转义问题
+        let cmd = """
+        '\(bin)' uninstall >/dev/null 2>&1 || true
+        launchctl bootout system/cc.chlc.batt >/dev/null 2>&1 || true
+        rm -f /Library/LaunchDaemons/cc.chlc.batt.plist
+        rm -f /etc/batt.json
+        rm -f '\(home)/.local/bin/batt'
+        rm -f '\(home)/Library/LaunchAgents/com.ping.batterybuddy.plist'
+        rm -rf '\(appPath)'
+        echo cleaned
+        """
+        let b64 = Data(cmd.utf8).base64EncodedString()
+        let script = "do shell script \"echo \(b64) | base64 -d | /bin/sh\" with administrator privileges"
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            p.arguments = ["-e", script]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            var ok = false
+            if (try? p.run()) != nil {
+                p.waitUntilExit()
+                ok = p.terminationStatus == 0
+            }
+            DispatchQueue.main.async {
+                if ok {
+                    NSApp.terminate(nil)
+                } else {
+                    let err = NSAlert()
+                    err.messageText = "卸载未完成"
+                    err.informativeText = "授权被取消或执行失败。可以改用安装包里的「卸载.command」。"
+                    err.runModal()
+                }
+            }
+        }
     }
 
     @objc func openManager() {

@@ -37,6 +37,18 @@ echo "==> 组装 app"
 cp "$BUILD/$BIN_NAME" "$APP/Contents/MacOS/$BIN_NAME"
 cp Info.plist "$APP/Contents/Info.plist"
 chmod +x "$APP/Contents/MacOS/$BIN_NAME"
+
+# 把 batt 二进制一并打包，让 app 自包含（首次运行自动铺到 ~/.local/bin）
+BATT_SRC="$HOME/.local/bin/batt"
+[ -x "$BATT_SRC" ] || BATT_SRC="/usr/local/bin/batt"
+if [ -x "$BATT_SRC" ]; then
+    cp "$BATT_SRC" "$APP/Contents/Resources/batt"
+    chmod 755 "$APP/Contents/Resources/batt"
+    echo "    已内置 batt ($(du -h "$BATT_SRC" | cut -f1))"
+else
+    echo "    ⚠️ 未找到 batt，构建产物不自包含"
+fi
+
 codesign -s - --force --deep "$APP"
 
 echo "==> 打 dmg"
@@ -44,6 +56,38 @@ STAGE="$BUILD/dmg_stage"
 mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -sfn /Applications "$STAGE/Applications"
+
+# 备用卸载工具：app 打不开时用它
+cat > "$STAGE/卸载.command" <<'UNINSTALL_EOF'
+#!/bin/bash
+clear
+echo "=========================================="
+echo "  电池管家 - 卸载"
+echo "=========================================="
+echo ""
+echo "将停止充电限制、删除后台服务与所有配置文件。"
+echo "需要输一次开机密码。"
+echo ""
+read -n 1 -s -r -p "按任意键继续..."
+echo ""
+
+B="$HOME/.local/bin/batt"
+[ -x "$B" ] && sudo "$B" uninstall >/dev/null 2>&1
+
+sudo launchctl bootout system/cc.chlc.batt >/dev/null 2>&1
+sudo rm -f /Library/LaunchDaemons/cc.chlc.batt.plist
+sudo rm -f /etc/batt.json
+rm -f "$HOME/.local/bin/batt"
+rm -f "$HOME/Library/LaunchAgents/com.ping.batterybuddy.plist"
+rm -rf "/Applications/电池管家.app"
+
+echo ""
+echo "✅ 已卸载，充电行为恢复为 macOS 默认。"
+echo ""
+read -n 1 -s -r -p "按任意键关闭..."
+UNINSTALL_EOF
+chmod +x "$STAGE/卸载.command"
+
 rm -f "$BUILD/$APP_NAME.dmg" 2>/dev/null || true
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO -fs HFS+ "$BUILD/$APP_NAME.dmg" >/dev/null
 rm -rf "$STAGE" 2>/dev/null || true
